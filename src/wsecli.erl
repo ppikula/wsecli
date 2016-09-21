@@ -27,21 +27,27 @@
 -export([handle_event/3, handle_sync_event/4, handle_info/3, terminate/3, code_change/4]).
 
 -record(callbacks, {
-    on_open    = fun()-> undefined end,
-    on_error   = fun(_Reason)-> undefined end,
-    on_message = fun(_Type, _Message) -> undefined end,
-    on_close   = fun(_Reason) -> undefined end
+    on_open    :: on_open_callback(),
+    on_error   :: on_error_callback(),
+    on_message :: on_message_callback(),
+    on_close   :: on_close_callback()
   }).
+
+-record(http_fragment, {data :: binary()}).
+
 -record(data, {
     socket                         :: inet:socket(),
     handshake                      :: undefined | #handshake{},
-    cb  = #callbacks{},
-    fragmented_message = undefined :: undefined | #message{}
+    cb = default_callbacks()       :: callbacks(),
+    fragmented_message = undefined :: undefined | #message{},
+    http_fragment = undefined      :: undefined | http_fragment()
   }).
 
 %%========================================
 %% Types
 %%========================================
+-type callbacks()           :: #callbacks{}.
+-type data()                :: #data{}.
 -type encoding()            :: text | binary.
 -type client()              :: atom() | pid().
 -type on_open_callback()    :: fun(() -> any()).
@@ -49,6 +55,7 @@
 -type data_callback()       :: fun((text, string()) -> any()) | fun((binary, binary()) -> any()).
 -type on_message_callback() :: data_callback().
 -type on_close_callback()   :: fun((undefined) -> any()).
+-type http_fragment()       :: #http_fragment{}.
 
 %%========================================
 %% Constants
@@ -277,12 +284,12 @@ init({Host, Port, Resource, SSL}) ->
 %% @hidden
 -spec connecting(
   {on_open, Callback :: fun()},
-  StateData :: #data{}
+  StateData :: data()
   ) -> term()
     ;
   (
   {send, Data :: binary()},
-  StateData :: #data{}
+  StateData :: data()
   ) -> term().
 connecting({on_open, Callback}, StateData) ->
   Callbacks = StateData#data.cb#callbacks{on_open = Callback},
@@ -295,10 +302,10 @@ connecting({send, _Data}, StateData) ->
 %% @hidden
 -spec open(
   Event     :: term(),
-  StateData :: #data{}
+  StateData :: data()
   ) -> term().
 open({on_open, Callback}, StateData) ->
-  spawn(Callback),
+  execute_callback(Callback),
   {next_state, open, StateData};
 open({send, Data, Type}, StateData) ->
   Message = wsock_message:encode(Data, [mask, Type]),
@@ -309,7 +316,7 @@ open({send, Data, Type}, StateData) ->
 %% @hidden
 -spec closing(
   Event     :: term(),
-  StateData :: #data{}
+  StateData :: data()
   ) -> term().
 closing({send, _Data}, StateData) ->
   (StateData#data.cb#callbacks.on_error)("Can't send data while in closing state"),
@@ -340,7 +347,7 @@ handle_event({on_close, Callback}, StateName, StateData) ->
   Event     :: stop,
   From      :: {pid(), reference()},
   StateName :: atom(),
-  StateData :: #data{}
+  StateData :: data()
   ) -> {reply, term(), atom(), term()} |
        {stop, term(), term(), #data{}}.
 handle_sync_event(stop, _From, closing, StateData) ->
@@ -358,17 +365,14 @@ handle_sync_event(stop, _From, open, StateData) ->
 -spec handle_info(
   {socket, Value :: term()},
   StateName :: connecting,
-  StateData :: #data{}
+  StateData :: data()
   ) -> {next_state, atom(), #data{}}.
-handle_info({socket, {data, Data}}, connecting, StateData) ->
-  {ok, Response} = wsock_http:decode(Data, response),
-  case wsock_handshake:handle_response(Response, StateData#data.handshake) of
-    {ok, _Handshake} ->
-      spawn(StateData#data.cb#callbacks.on_open),
-      {next_state, open, StateData};
-    {error, _Error} ->
-      {stop, failed_handshake, StateData}
-  end;
+handle_info({socket, {data, Data}}, connecting, StateData = #data{http_fragment = undefined}) ->
+  do_wsock_httpdecode(Data, StateData);
+handle_info({socket, {data, DataIn}}, connecting,
+            StateData = #data{http_fragment = #http_fragment{data = Previous}}) ->
+  Data = <<Previous/binary, DataIn/binary>>,
+  do_wsock_httpdecode(Data, StateData);
 handle_info({socket, {data, Data}}, open, StateData) ->
   {Messages, State} = case StateData#data.fragmented_message of
     undefined ->
@@ -391,15 +395,32 @@ handle_info({socket, {data, Data}}, closing, StateData) ->
 handle_info({socket, close}, _StateName, StateData) ->
   {stop, normal, StateData}.
 
+do_wsock_httpdecode(Data, StateData) ->
+    case wsock_http:decode(Data, response) of
+        {ok, Response} ->
+            Resp = wsock_handshake:handle_response(Response, StateData#data.handshake),
+            do_handle_response(Resp, StateData#data{http_fragment = undefined});
+        {error, fragmented_http_message} ->
+            {next_state, connecting, StateData#data{http_fragment = http_fragment(Data)}};
+        {error, malformed_request} ->
+            erlang:exit(malformed_request)
+    end.
+
+do_handle_response({ok, _Handshake}, StateData) ->
+    execute_callback(StateData#data.cb#callbacks.on_open),
+    {next_state, open, StateData#data{fragmented_message = undefined}};
+do_handle_response({error, _Error}, StateData) ->
+    {stop, failed_handshake, StateData}.
+
 %% @hidden
 -spec terminate(
   Reason::atom(),
   StateName::atom(),
-  StateData :: #data{}
+  StateData :: data()
   ) -> pid().
 terminate(_Reason, _StateName, StateData) ->
   wsecli_socket:close(StateData#data.socket),
-  spawn(fun() -> (StateData#data.cb#callbacks.on_close)(undefined) end).
+  execute_callback(fun() -> (StateData#data.cb#callbacks.on_close)(undefined) end).
 
 %% @hidden
 code_change(_OldVsn, StateName, StateData, _Extra) ->
@@ -410,19 +431,37 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%========================================
 -spec process_messages(
   Messages  :: list(#message{}),
-  StateData :: #data{}
+  StateData :: data()
   ) -> #data{}.
 process_messages([], StateData) ->
   StateData;
 process_messages([Message | Messages], StateData) ->
   case Message#message.type of
     text ->
-      spawn(fun() -> (StateData#data.cb#callbacks.on_message)(text, Message#message.payload) end),
+      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(text, Message#message.payload) end),
       process_messages(Messages, StateData);
     binary ->
-      spawn(fun() -> (StateData#data.cb#callbacks.on_message)(binary, Message#message.payload) end),
+      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(binary, Message#message.payload) end),
       process_messages(Messages, StateData);
     fragmented ->
       NewStateData = StateData#data{fragmented_message = Message},
       process_messages(Messages, NewStateData)
   end.
+
+-spec default_callbacks() -> callbacks().
+default_callbacks() ->
+    #callbacks{on_open = fun() -> undefined end,
+               on_error = fun(_Reason)-> undefined end,
+               on_message = fun(_Type, _Message) -> undefined end,
+               on_close = fun(_Reason) -> undefined end}.
+
+-spec http_fragment(binary()) -> http_fragment().
+http_fragment(Data) -> #http_fragment{data = Data}.
+
+execute_callback(F) ->
+    try
+        F()
+    catch Class:Error ->
+        error_logger:error_msg("application=wsecli, issue=hook_failed, reason=~1000p:~1000p", 
+                               [Class, Error])
+    end.
